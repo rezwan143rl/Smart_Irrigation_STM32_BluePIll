@@ -1,0 +1,38 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+**/Debug/
+**/Release/
+
+# Object files, dependency files, listings
+*.o
+*.d
+*.su
+*.cyclo
+*.list
+*.map
+*.elf
+*.bin
+*.hex
+
+# STM32CubeIDE workspace/project metadata
+.metadata/
+.settings/
+RemoteSystemsTempFiles/
+Servers/
+
+# Eclipse/CDT backup files
+*.cproject.bak
+*.launch.bak
+
+# STM32CubeMX backup/log files
+*.ioc.bak
+STM32CubeMX_generation.log
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+Debug/
