@@ -23,7 +23,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 #include "ssd1306.h"
 #include "dht22.h"
 #include "rain_sensor.h"
@@ -32,8 +31,8 @@
 #include "buzzer.h"
 #include "soil_moisture.h"
 #include "irrigation.h"
+#include "display_screens.h"
 #include <stdio.h>
-#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,7 +58,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
-DMA_HandleTypeDef hdma_adc1;
+ADC_HandleTypeDef hadc2;
 
 I2C_HandleTypeDef hi2c1;
 
@@ -77,11 +76,11 @@ char test_buffer[32];
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_ADC2_Init(void);
 /* USER CODE BEGIN PFP */
 
 
@@ -121,13 +120,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_TIM2_Init();
-
-
   MX_USART1_UART_Init();
+  MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
   ///////SETUP////////////
     SSD1306_Init(&hi2c1);
@@ -151,68 +148,80 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  while (1)
-  {
+    while (1)
+    {
     /* USER CODE END WHILE */
 
-	  /* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
 
-	  static uint8_t pump_should_run = 0;
-	      uint8_t pump_timeout_flag = 0;
+      static uint8_t pump_should_run = 0;
+      static uint8_t screen_index = 0;
+      uint8_t pump_timeout_flag = 0;
+      uint8_t cooldown_active = 0;
 
-	      HAL_ADC_Start(&hadc1);
-	      HAL_ADC_PollForConversion(&hadc1, 100);
-	      uint16_t soil_raw = HAL_ADC_GetValue(&hadc1);
-	      HAL_ADC_PollForConversion(&hadc1, 100);
-	      uint16_t water_raw = HAL_ADC_GetValue(&hadc1);
-	      HAL_ADC_Stop(&hadc1);
+      uint16_t soil_raw = 0, water_raw = 0;
 
-	      uint8_t soil_pct  = Soil_ToPercent(soil_raw);
-	      uint8_t water_low = WaterLevel_IsLow(water_raw);
-	      uint8_t raining   = RainSensor_IsRaining();
+      HAL_ADC_Start(&hadc1);
+      HAL_ADC_PollForConversion(&hadc1, 100);
+      soil_raw = HAL_ADC_GetValue(&hadc1);      // ADC1 channel 4 (soil, PA4)
+      HAL_ADC_Stop(&hadc1);
 
-	      float temp = 0.0f, hum = 0.0f;
-	      DHT22_Status dht_status = DHT22_Read(&temp, &hum);
-
-	      uint8_t manual_mode = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_RESET);
-
-	      if (manual_mode) {
-	          pump_should_run = (!water_low && !raining) ? 1 : 0;
-	      } else {
-	          Irrigation_Decide(soil_pct, water_low, raining, &pump_should_run);
-	      }
-
-	      Pump_SafeControl(pump_should_run, &pump_timeout_flag);
-
-	      uint8_t warning = water_low || pump_timeout_flag;
-	      StatusLED_Warning(warning);
-	      if (warning) Buzzer_On(); else Buzzer_Off();
-	      StatusLED_OK(!warning);
-
-	      counter++;
-
-	      SSD1306_Clear();
-	      char line1[20];
-	      sprintf(line1, "S:%3d%% W:%s", soil_pct, water_low ? "LOW" : "OK ");
-	      SSD1306_SetCursor(0, 0);
-	      SSD1306_WriteString(line1);
-
-	      char line2[20];
-	      if (dht_status == DHT22_OK)
-	          sprintf(line2, "T:%2d H:%2d R:%s", (int)temp, (int)hum, raining ? "Y" : "N");
-	      else
-	          sprintf(line2, "DHT ERR R:%s", raining ? "Y" : "N");
-	      SSD1306_SetCursor(0, 16);
-	      SSD1306_WriteString(line2);
-
-	      SSD1306_UpdateScreen();
-
-	      HAL_Delay(2000);
+      HAL_ADC_Start(&hadc2);
+      HAL_ADC_PollForConversion(&hadc2, 100);
+      water_raw = HAL_ADC_GetValue(&hadc2);     // ADC2 channel 1 (water level, PA1)
+      HAL_ADC_Stop(&hadc2);
 
 
-	      /* USER CODE END 3 */
+
+      uint8_t soil_pct  = Soil_ToPercent(soil_raw);
+      uint8_t water_low = WaterLevel_IsLow(water_raw);
+      uint8_t raining   = RainSensor_IsRaining();
+
+      float temp = 0.0f, hum = 0.0f;
+      DHT22_Status dht_status = DHT22_Read(&temp, &hum);
+
+      SensorFaults faults;
+      uint8_t any_fault = SensorFaults_Check(soil_raw, dht_status, &faults);
+
+      uint8_t manual_mode = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_RESET);
+
+      if (manual_mode) {
+          pump_should_run = (!water_low && !raining && !faults.soil_out_of_range) ? 1 : 0;
+      } else {
+          Irrigation_Decide(soil_pct, water_low, raining, faults.soil_out_of_range, &pump_should_run);
+      }
+
+      Pump_SafeControl(pump_should_run, soil_pct, &pump_timeout_flag, &cooldown_active);
+
+      uint8_t warning = water_low || pump_timeout_flag || cooldown_active || any_fault;
+      StatusLED_Warning(warning);
+      if (warning) Buzzer_On(); else Buzzer_Off();
+      StatusLED_OK(!warning);
+
+      counter++;
+
+      SystemStatus status = {
+          .soil_pct = soil_pct,
+          .water_low = water_low,
+          .raining = raining,
+          .temp = temp,
+          .hum = hum,
+          .dht_ok = (dht_status == DHT22_OK),
+          .pump_on = pump_should_run,
+          .manual_mode = manual_mode,
+          .warning = warning,
+          .cooldown_active = cooldown_active,
+          .sensor_fault = any_fault
+      };
+
+      Display_ShowScreen(screen_index, &status);
+      screen_index = (screen_index + 1) % DISPLAY_NUM_SCREENS;
+
+
+      HAL_Delay(2000);
+
+  /* USER CODE END 3 */
 }
-
 }
 /**
   * @brief System Clock Configuration
@@ -269,7 +278,6 @@ static void MX_ADC1_Init(void)
 {
 
   /* USER CODE BEGIN ADC1_Init 0 */
-
   /* USER CODE END ADC1_Init 0 */
 
   ADC_ChannelConfTypeDef sConfig = {0};
@@ -281,12 +289,12 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.NbrOfConversion = 1;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
     Error_Handler();
@@ -294,18 +302,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -313,6 +312,53 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
 
 }
 
@@ -429,22 +475,6 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -506,9 +536,9 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /*Configure ADC input pins : PA0 (ADC_CHANNEL_0 / soil) PA1 (ADC_CHANNEL_1 / sensor2) */
+  /*Configure ADC input pins : PA4 (ADC_CHANNEL_4 / soil, ADC1) PA1 (ADC_CHANNEL_1 / sensor2, ADC2) */
 
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_1;
 
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
 
